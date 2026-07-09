@@ -79,6 +79,7 @@ sudo python3 fa608-kbd.py --arm "1 0 255 255 255 0" --install
 - Requires sudo (needs raw HID access and sysfs write permissions)
 - One-shot arming does not survive a full power-off; use `--install` for a permanent fix
 - If your keyboard's USB ID differs from 0b05:19b6, the tool will tell you how to find it
+- This is only a workaround. The real fix belongs upstream (kernel/asusctl); this only bridges the gap until then.
 
 ## Background
 
