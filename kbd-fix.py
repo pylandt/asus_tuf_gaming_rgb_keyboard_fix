@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-fa608-kbd.py - ASUS TUF FA608 keyboard RGB tool (ITE5570, USB id 0b05:19b6)
+kbd-fix.py - ASUS TUF Gaming keyboard RGB tool (ITE5570, USB id 0b05:19b6)
 
-The RGB keyboard controller on FA608-series laptops must be "armed" with a
+The RGB keyboard controller on FA*-series laptops must be "armed" with a
 vendor HID feature report after every cold power-off (Windows/Armoury Crate
 does this; Linux drivers currently do not). This tool reads the keyboard's
 HID report descriptor to discover the correct arming report IDs for YOUR
@@ -11,19 +11,19 @@ service so the lighting returns automatically on every boot and resume.
 
 USAGE
   Analyse only (read-only - just lists the report IDs for your model):
-      sudo python3 fa608-kbd.py
+      sudo python3 kbd-fix.py
 
   Arm + set colour now (mode string = kbd_rgb_mode format, see below):
-      sudo python3 fa608-kbd.py --arm "<your mode string>"
+      sudo python3 kbd-fix.py --arm "<your mode string>"
 
   Arm + set colour AND install a permanent boot/resume service:
-      sudo python3 fa608-kbd.py --arm "<your mode string>" --install
+      sudo python3 kbd-fix.py --arm "<your mode string>" --install
 
   Remove the installed service:
-      sudo python3 fa608-kbd.py --uninstall
+      sudo python3 kbd-fix.py --uninstall
 
   Show this help:
-      python3 fa608-kbd.py --help
+      python3 kbd-fix.py --help
 
 MODE STRING (kbd_rgb_mode) = "save mode R G B speed"
   save : 1 = persist the setting
@@ -39,8 +39,8 @@ MODE STRING (kbd_rgb_mode) = "save mode R G B speed"
 
 CAVEATS
   - Run with sudo (needs raw HID + sysfs write access).
-  - Confirmed on FA608UP. Other FA608 variants (WV/WI/UM/...) SHOULD work via
-    auto-detection but are untested - please report results.
+  - Confirmed on FA608UP, FA608UH & FA808UM. Other variants SHOULD work via
+    auto-detection but are untested.
   - Assumes the keyboard is USB id 0b05:19b6. If your keyboard differs, the
     tool will say so and show you how to find your id.
   - One-shot arming does not survive a full power-off; use --install for a
@@ -50,15 +50,15 @@ import glob, os, sys, fcntl, re, shutil
 
 VID, PID = "0B05", "19B6"
 LED_BASE = "/sys/class/leds/asus::kbd_backlight"
-SERVICE_NAME = "fa608-kbd-rgb.service"
+SERVICE_NAME = "kbd-rgb.service"
 SERVICE_PATH = f"/etc/systemd/system/{SERVICE_NAME}"
-INSTALL_BIN  = "/usr/local/bin/fa608-kbd.py"
+INSTALL_BIN  = "/usr/local/bin/kbd-fix.py"
 DEFAULT_MODE = "1 0 255 255 255 0"   # static white
 
 # ---------- helpers ----------
 def require_root():
     if os.geteuid() != 0:
-        print("This needs root. Re-run with:  sudo python3 fa608-kbd.py ...", file=sys.stderr)
+        print("This needs root. Re-run with:  sudo python3 kbd-fix.py ...", file=sys.stderr)
         sys.exit(1)
 
 def valid_mode_string(s):
@@ -122,7 +122,7 @@ def is_vendor_page(up):
         return False
     if up >= 0xFF00:        # standard vendor-defined range
         return True
-    if up in (0x59,):       # ASUS Aura page seen on FA608 keyboards
+    if up in (0x59,):       # ASUS Aura page seen on FA* keyboards
         return True
     return False
 
@@ -225,7 +225,7 @@ def do_analyse():
             print(f"    page {hex(up)}: {[hex(x) for x in sorted(fids[up])]}{mark}")
         print(f"  >> Candidate ARM report IDs: {[hex(x) for x in ids]}")
     print("\nArm + set colour now, e.g. static white:")
-    print(f'  sudo python3 fa608-kbd.py --arm "{DEFAULT_MODE}"')
+    print(f'  sudo python3 kbd-fix.py --arm "{DEFAULT_MODE}"')
     print("Add --install to make it permanent across reboots.")
     return 0
 
@@ -252,7 +252,7 @@ def do_install(mode_str):
         return 1
     # mode_str is validated above (digits/spaces only) so it is safe to embed.
     service = f"""[Unit]
-Description=ASUS FA608 keyboard RGB arm and colour
+Description=ASUS keyboard RGB arm and colour
 After=multi-user.target suspend.target hibernate.target hybrid-sleep.target
 
 [Service]
@@ -274,7 +274,7 @@ WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target
     os.system(f"systemctl enable --now {SERVICE_NAME}")
     print(f"installed {SERVICE_PATH}")
     print(f"  arms + sets mode '{mode_str}' on every boot and resume")
-    print(f"  remove with: sudo python3 fa608-kbd.py --uninstall")
+    print(f"  remove with: sudo python3 kbd-fix.py --uninstall")
     return 0
 
 def do_uninstall():
