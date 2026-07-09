@@ -1,6 +1,6 @@
-# ASUS TUF Gaming A16 Keyboard RGB Controller Fix
+# ASUS TUF Gaming Keyboard RGB Controller Fix
 
-On ASUS TUF Gaming A16 FA608* models, the keyboard RGB controller (ITE5570, USB id 0b05:19b6) must be "armed" on cold boot by sending HID feature reports to the keyboard. Windows/Armoury Crate handles this automatically, but Linux drivers currently do not.
+On ASUS TUF Gaming models, the keyboard RGB controller (ITE5570, USB id 0b05:19b6) must be "armed" on cold boot by sending HID feature reports to the keyboard. Windows/Armoury Crate handles this automatically, but Linux drivers currently do not.
 
 This tool reads your keyboard's HID report descriptor to discover the correct arming report IDs for YOUR specific model, arms the controller, sets a colour, and can install a systemd service so the lighting returns automatically on every boot and resume.
 
@@ -8,22 +8,22 @@ This tool reads your keyboard's HID report descriptor to discover the correct ar
 
 ### 1. Analyse only (read-only - just lists the report IDs for your model):
 ```bash
-sudo python3 fa608-kbd.py
+sudo python3 kbd-fix.py
 ```
 
 ### 2. Arm + set colour now (mode string = kbd_rgb_mode format):
 ```bash
-sudo python3 fa608-kbd.py --arm "<your mode string>"
+sudo python3 kbd-fix.py --arm "<your mode string>"
 ```
 
 ### 3. Arm + set colour AND install a permanent boot/resume service:
 ```bash
-sudo python3 fa608-kbd.py --arm "<your mode string>" --install
+sudo python3 kbd-fix.py --arm "<your mode string>" --install
 ```
 
 ### 4. Remove the installed service:
 ```bash
-sudo python3 fa608-kbd.py --uninstall
+sudo python3 kbd-fix.py --uninstall
 ```
 
 ## Mode String Format
@@ -46,13 +46,13 @@ sudo python3 fa608-kbd.py --uninstall
 
 ```bash
 # Check your model's report IDs:
-sudo python3 fa608-kbd.py
+sudo python3 kbd-fix.py
 
 # Arm and set static white lighting:
-sudo python3 fa608-kbd.py --arm "1 0 255 255 255 0"
+sudo python3 kbd-fix.py --arm "1 0 255 255 255 0"
 
 # Make it permanent (automatically arm on every boot/resume):
-sudo python3 fa608-kbd.py --arm "1 0 255 255 255 0" --install
+sudo python3 kbd-fix.py --arm "1 0 255 255 255 0" --install
 ```
 
 ## Requirements
@@ -63,8 +63,8 @@ sudo python3 fa608-kbd.py --arm "1 0 255 255 255 0" --install
 
 ## Compatibility
 
-- ASUS TUF Gaming A16 FA608* (confirmed working for FA608UP, FA608UH)
-- Other FA608 variants should work via auto-detection but may need testing - please report results
+- ASUS TUF Gaming (so far confirmed working for FA608UP, FA608UH & FA808UM)
+- Other FA* variants should work via auto-detection but may need testing - please report results
 
 ## How It Works
 
@@ -86,12 +86,12 @@ sudo python3 fa608-kbd.py --arm "1 0 255 255 255 0" --install
 This script was created to address the issue discussed in the official `asusctl` repository:
 - [OpenGamingCollective/asusctl#119](https://github.com/OpenGamingCollective/asusctl/issues/119#issuecomment-4783713758)
 
-The issue documents the RGB controller arming problem on FA608* models and the solution implemented in this tool.
+The issue documents the RGB controller arming problem on FA608* and FA808* models and the solution implemented in this tool.
 
 ## Support
 
 If you encounter any issues:
-1. Run `sudo python3 fa608-kbd.py` to see your device's detected report IDs
+1. Run `sudo python3 kbd-fix.py` to see your device's detected report IDs
 2. Check that your keyboard is detected (USB id 0b05:19b6)
 3. Report results on this repository or the [asusctl issue](https://github.com/OpenGamingCollective/asusctl/issues/119)
 
