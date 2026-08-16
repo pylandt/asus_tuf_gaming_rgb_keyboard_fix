@@ -1,29 +1,43 @@
 #!/usr/bin/env python3
 """
-kbd-fix.py - ASUS TUF Gaming keyboard RGB tool (ITE5570, USB id 0b05:19b6)
+kbd-fix.py - ASUS TUF Gaming keyboard RGB tool
 
-The RGB keyboard controller on FA*-series laptops must be "armed" with a
-vendor HID feature report after every cold power-off (Windows/Armoury Crate
-does this; Linux drivers currently do not). This tool reads the keyboard's
-HID report descriptor to discover the correct arming report IDs for YOUR
-specific model, arms the controller, sets a colour, and can install a systemd
-service so the lighting returns automatically on every boot and resume.
+Restore keyboard RGB control on Linux for HID LampArray keyboards.
+
+PROBLEM
+    Modern ASUS TUF/ROG keyboards (ITE controllers on I2C-HID, invisible to
+    lsusb) implement HID LampArray, the standard behind Windows Dynamic
+    Lighting.  Its AutonomousMode flag -- "Lighting And Illumination" usage
+    page 0x59, usage 0x71 -- decides who owns the lamps:
+
+        0 = the host owns them exclusively; nothing else may change them
+        1 = the device drives its own lamps (embedded effects / EC)
+
+    The controller powers up with AutonomousMode = 0, waiting for a Dynamic
+    Lighting host that does not exist on Linux.  So the keys stay dark, and
+    writes to /sys/class/leds/*kbd_backlight succeed in the kernel but are
+    ignored by the device.  Booting Windows clears it -- Windows restores
+    AutonomousMode when it releases the device -- until the next power-off.
+
+FIX
+    Write AutonomousMode = 1: one feature report, one byte.  That releases
+    the host lock, after which the kernel colour interface works normally.
+    The report ID is read from the device's own HID descriptor, so no
+    per-model table is needed.  The setting is lost on power-off, hence
+    --install.
 
 USAGE
-  Analyse only (read-only - just lists the report IDs for your model):
-      sudo python3 kbd-fix.py
-
-  Arm + set colour now (mode string = kbd_rgb_mode format, see below):
-      sudo python3 kbd-fix.py --arm "<your mode string>"
-
-  Arm + set colour AND install a permanent boot/resume service:
-      sudo python3 kbd-fix.py --arm "<your mode string>" --install
-
-  Remove the installed service:
-      sudo python3 kbd-fix.py --uninstall
-
-  Show this help:
-      python3 kbd-fix.py --help
+    Analyse (read-only):
+    sudo ./kbd-fix.py
+    
+    Release lock, set colour:
+    sudo ./kbd-fix.py --arm "<your mode string>"
+    
+    Release lock, set colour AND install a permanent boot/resume service:
+    sudo ./kbd-fix.py --arm "<your mode string>" --install
+    
+    Remove the installed service:
+    sudo ./kbd-fix.py --uninstall
 
 MODE STRING (kbd_rgb_mode) = "save mode R G B speed"
   save : 1 = persist the setting
@@ -36,294 +50,462 @@ MODE STRING (kbd_rgb_mode) = "save mode R G B speed"
     static red   : "1 0 255 0 0 0"
     breathe blue : "1 1 0 0 255 1"
     slow rainbow : "1 2 0 0 0 0" 
-
-CAVEATS
-  - Run with sudo (needs raw HID + sysfs write access).
-  - Confirmed on FA608UP, FA608UH & FA808UM. Other variants SHOULD work via
-    auto-detection but are untested.
-  - Assumes the keyboard is USB id 0b05:19b6. If your keyboard differs, the
-    tool will say so and show you how to find your id.
-  - One-shot arming does not survive a full power-off; use --install for a
-    permanent fix.
 """
-import glob, os, sys, fcntl, re, shutil
 
-VID, PID = "0B05", "19B6"
-LED_BASE = "/sys/class/leds/asus::kbd_backlight"
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import glob
+import os
+import re
+import shutil
+import sys
+from dataclasses import dataclass, field
+
+# HID "Lighting And Illumination" page and the AutonomousMode usage within it.
+# Vendors may mirror the same collection onto a private page (>= 0xFF00).
+LIGHTING_PAGE = 0x59
+USAGE_AUTONOMOUS_MODE = 0x71
+
+LED_GLOB = "/sys/class/leds/*kbd_backlight"
 SERVICE_NAME = "kbd-rgb.service"
 SERVICE_PATH = f"/etc/systemd/system/{SERVICE_NAME}"
-INSTALL_BIN  = "/usr/local/bin/kbd-fix.py"
-DEFAULT_MODE = "1 0 255 255 255 0"   # static white
+INSTALL_BIN = "/usr/local/bin/kbd-fix.py"
+DEFAULT_MODE = "1 0 255 255 255 0"  # static white
+DEFAULT_BRIGHTNESS = 3
 
-# ---------- helpers ----------
-def require_root():
-    if os.geteuid() != 0:
-        print("This needs root. Re-run with:  sudo python3 kbd-fix.py ...", file=sys.stderr)
-        sys.exit(1)
+MODE_RE = re.compile(r"\A\d{1,3}(?: \d{1,3}){5}\Z")
 
-def valid_mode_string(s):
-    """A kbd_rgb_mode value: exactly 6 space-separated integers, each 0-255."""
-    parts = s.split()
-    if len(parts) != 6:
-        return False
-    for p in parts:
-        if not re.fullmatch(r"\d{1,3}", p):
-            return False
-        if not (0 <= int(p) <= 255):
-            return False
-    return True
 
-# ---------- device / descriptor ----------
-def find_kbd_hidraw():
-    nodes = []
-    for node in sorted(glob.glob("/dev/hidraw*")):
-        name = os.path.basename(node)
-        try:
-            ue = open(f"/sys/class/hidraw/{name}/device/uevent").read().upper()
-        except OSError:
-            continue
-        if VID in ue and PID in ue:
-            nodes.append((node, name))
-    return nodes
+# ---------- HID plumbing ----------
 
-def read_descriptor(name):
-    with open(f"/sys/class/hidraw/{name}/device/report_descriptor", "rb") as f:
-        return f.read()
+def _hid_ioctl(nr: int, size: int) -> int:
+    """_IOC(_IOC_WRITE|_IOC_READ, 'H', nr, size) -- the HIDIOC* macro form."""
+    return (3 << 30) | (size << 16) | (ord("H") << 8) | nr
 
-def parse_feature_report_ids(desc):
-    """Walk the HID report descriptor; return {usage_page: set(report_ids)}
-    for every report id that has a FEATURE main item."""
-    i, up, rid, fids = 0, None, None, {}
-    n = len(desc)
-    while i < n:
-        b = desc[i]
-        if b == 0xFE:                       # long item: 0xFE, bDataSize, bTag, data...
-            if i + 1 < n:
-                i += 3 + desc[i+1]
-            else:
-                break
-            continue
-        tag, size = b & 0xFC, b & 0x03
-        dlen = {0:0, 1:1, 2:2, 3:4}[size]
-        if i + 1 + dlen > n:                # truncated/garbage - stop safely
-            break
-        data = desc[i+1:i+1+dlen]
-        val = int.from_bytes(data, "little") if data else 0
-        if tag == 0x04:    up = val         # Usage Page (global)
-        elif tag == 0x84:  rid = val        # Report ID (global)
-        elif tag == 0xB0:                   # Feature (main)
-            if up is not None and rid is not None:
-                fids.setdefault(up, set()).add(rid)
-        i += 1 + dlen
-    return fids
 
-def is_vendor_page(up):
-    if up is None:
-        return False
-    if up >= 0xFF00:        # standard vendor-defined range
-        return True
-    if up in (0x59,):       # ASUS Aura page seen on FA* keyboards
-        return True
-    return False
-
-def candidate_arm_ids(name):
-    fids = parse_feature_report_ids(read_descriptor(name))
-    vendor = []
-    for up in sorted(fids):
-        if is_vendor_page(up):
-            vendor += sorted(fids[up])
-    return sorted(set(vendor)), fids
-
-# ---------- actions ----------
-def send_feature(node, report_id, length=64):
-    if length < 2:
-        length = 2
-    buf = bytes([report_id & 0xFF, 0x01] + [0x00] * (length - 2))
+@contextlib.contextmanager
+def _hid_open(path: str):
+    fd = os.open(path, os.O_RDWR)
     try:
-        fd = os.open(node, os.O_RDWR)
-    except OSError as e:
-        print(f"    cannot open {node}: {e}")
-        return False
-    try:
-        ioc = (3 << 30) | (len(buf) << 16) | (ord('H') << 8) | 0x06  # HIDIOCSFEATURE
-        fcntl.ioctl(fd, ioc, bytes(buf))
-        return True
-    except OSError as e:
-        print(f"    arm id {hex(report_id)} failed: {e}")
-        return False
+        yield fd
     finally:
         os.close(fd)
 
-def set_colour(mode_str):
-    if not os.path.isdir(LED_BASE):
-        print(f"  {LED_BASE} not found - kernel kbd_backlight interface missing; "
-              "cannot set colour (controller may still be armed).")
+
+def _get_feature(fd: int, report_id: int, size: int) -> bytes | None:
+    """HIDIOCGFEATURE. Returns the payload without its ID byte, or None.
+
+    The ioctl yields the byte count actually read; anything at or below the
+    report-ID byte means the device did not answer.  Distinguishing that from
+    a genuine zero matters, because some controllers accept the write but do
+    not report state back.
+    """
+    buf = bytearray(size + 1)
+    buf[0] = report_id
+    try:
+        read = fcntl.ioctl(fd, _hid_ioctl(0x07, len(buf)), buf, True)
+    except OSError:
+        return None
+    return bytes(buf[1:read]) if isinstance(read, int) and read > 1 else None
+
+
+def _set_feature(fd: int, report_id: int, payload: bytes) -> bool:
+    """HIDIOCSFEATURE. Writes exactly the report's declared length."""
+    buf = bytes((report_id,)) + payload
+    try:
+        fcntl.ioctl(fd, _hid_ioctl(0x06, len(buf)), buf)
+    except OSError as exc:
+        print(f"    write to report {report_id:#04x} failed: {exc}")
         return False
-    ok = True
-    for fname, value in (("kbd_rgb_state", "1 1 1 1 1"),
-                         ("kbd_rgb_mode",  mode_str),
-                         ("brightness",    "3")):
-        path = f"{LED_BASE}/{fname}"
+    return True
+
+
+# ----------- descriptor parsing ----------
+
+@dataclass
+class Report:
+    """Feature-item facts for one report ID."""
+
+    usages: set[tuple[int, int]] = field(default_factory=set)  # (page, usage)
+    bits: int = 0
+
+    @property
+    def size(self) -> int:
+        return max(1, (self.bits + 7) // 8)
+
+
+def parse_descriptor(desc: bytes) -> dict[int, Report]:
+    """Collect FEATURE items from a HID report descriptor, keyed by report ID.
+
+    Global items (usage page, report ID/size/count) persist until changed and
+    are saved/restored by Push/Pop; local items (usage) are consumed by the
+    next main item.  Usage *ranges* are ignored -- LampArray always declares
+    AutonomousMode as a single usage.  Malformed input ends the walk rather
+    than raising.
+    """
+    state = {"page": None, "id": 0, "size": 0, "count": 0}
+    stack: list[dict] = []
+    usages: list[tuple[int, int]] = []
+    reports: dict[int, Report] = {}
+    pos, end = 0, len(desc)
+
+    while pos < end:
+        prefix = desc[pos]
+
+        if prefix == 0xFE:  # long item: prefix, data length, tag, data...
+            if pos + 1 >= end:
+                break
+            pos += 3 + desc[pos + 1]
+            continue
+
+        tag = prefix & 0xFC
+        size_code = prefix & 0x03
+        length = 4 if size_code == 3 else size_code
+        if pos + 1 + length > end:
+            break
+        value = int.from_bytes(desc[pos + 1:pos + 1 + length], "little")
+
+        if tag == 0x04:                        # Usage Page (global)
+            state["page"] = value
+        elif tag == 0x84:                      # Report ID (global)
+            state["id"] = value
+        elif tag == 0x74:                      # Report Size (global)
+            state["size"] = value
+        elif tag == 0x94:                      # Report Count (global)
+            state["count"] = value
+        elif tag == 0xA4:                      # Push
+            stack.append(dict(state))
+        elif tag == 0xB4:                      # Pop
+            if stack:
+                state = stack.pop()
+        elif tag == 0x08:                      # Usage (local)
+            # A 4-byte usage carries its own page in the high half.
+            usages.append((value >> 16, value & 0xFFFF) if length == 4
+                          else (state["page"], value))
+        elif tag == 0xB0:                      # Feature (main)
+            report = reports.setdefault(state["id"], Report())
+            report.bits += state["size"] * state["count"]
+            report.usages.update(usages)
+            usages.clear()
+        elif tag in (0x80, 0x90, 0xA0, 0xC0):  # Input/Output/Collection/End
+            usages.clear()                     # other main items also consume
+
+        pos += 1 + length
+
+    return reports
+
+
+# ---------- devices ----------
+
+@dataclass
+class Control:
+    """A feature report carrying AutonomousMode."""
+
+    report_id: int
+    page: int
+    size: int
+
+    @property
+    def standard(self) -> bool:
+        return self.page == LIGHTING_PAGE
+
+    def __str__(self) -> str:
+        kind = "spec page" if self.standard else "vendor mirror"
+        return (f"report {self.report_id:#04x} page {self.page:#06x} "
+                f"({kind}), {self.size}B")
+
+
+@dataclass
+class Device:
+    path: str
+    name: str
+    hid_id: str
+    controls: list[Control]
+
+
+def _controls(reports: dict[int, Report]) -> list[Control]:
+    """AutonomousMode reports, standard page first."""
+    found = [
+        Control(report_id, page, report.size)
+        for report_id, report in sorted(reports.items())
+        for page, usage in report.usages
+        if usage == USAGE_AUTONOMOUS_MODE
+        and (page == LIGHTING_PAGE or (page or 0) >= 0xFF00)
+    ]
+    return sorted(found, key=lambda control: not control.standard)
+
+
+def discover() -> list[Device]:
+    """LampArray devices, found by descriptor content rather than USB id.
+
+    Matching on the descriptor is what makes this vendor and model neutral,
+    and it is the only option for I2C-HID keyboards, which never appear in
+    lsusb.
+    """
+    devices = []
+    for path in sorted(glob.glob("/dev/hidraw*")):
+        sysfs = f"/sys/class/hidraw/{os.path.basename(path)}/device"
         try:
-            with open(path, "w") as f:
-                f.write(value)
-        except OSError as e:
-            print(f"  write {path} failed: {e}")
+            with open(f"{sysfs}/report_descriptor", "rb") as handle:
+                controls = _controls(parse_descriptor(handle.read()))
+        except OSError:
+            continue
+        if not controls:
+            continue
+        info: dict[str, str] = {}
+        with contextlib.suppress(OSError), open(f"{sysfs}/uevent") as handle:
+            info = dict(line.split("=", 1)
+                        for line in handle.read().splitlines() if "=" in line)
+        devices.append(Device(path, info.get("HID_NAME", "?"),
+                              info.get("HID_ID", "?"), controls))
+    return devices
+
+
+def _fmt(value: int | None) -> str:
+    return {None: "unreadable", 0: "host-locked",
+            1: "device-controlled"}.get(value, str(value))
+
+
+def read_mode(fd: int, control: Control) -> int | None:
+    data = _get_feature(fd, control.report_id, control.size)
+    return data[0] if data else None
+
+
+def release_lock(device: Device) -> bool:
+    """Set AutonomousMode = 1 on each control report.
+
+    Success is whether the write was accepted, not whether the read-back
+    agrees: some controllers apply the setting yet never answer state
+    queries, so the read-back is diagnostic only.  A confirmed report
+    short-circuits the rest, so a vendor mirror is written only when the
+    standard report does not confirm.
+    """
+    written_any = False
+    with _hid_open(device.path) as fd:
+        for control in device.controls:
+            before = read_mode(fd, control)
+            written = _set_feature(fd, control.report_id,
+                                   b"\x01".ljust(control.size, b"\0"))
+            after = read_mode(fd, control)
+            written_any |= written
+            if not written:
+                note = "  [write rejected]"
+            elif after is None:
+                note = "  [accepted; state not readable]"
+            elif after != 1:
+                note = "  [accepted but still reported as locked]"
+            else:
+                note = ""
+            print(f"  {control}: {_fmt(before)} -> {_fmt(after)}{note}")
+            if after == 1:
+                break
+    return written_any
+
+
+# ---------- colour ----------
+
+RGB_ATTR = "kbd_rgb_mode"
+# Written in this order: enable all power states, set the effect, then level.
+LED_ATTRS = ("kbd_rgb_state", RGB_ATTR, "brightness")
+
+
+def led_node() -> str | None:
+    """Prefer an RGB-capable kbd_backlight node over a brightness-only one."""
+    nodes = sorted(glob.glob(LED_GLOB))
+    return next((node for node in nodes
+                 if os.path.exists(f"{node}/{RGB_ATTR}")),
+                nodes[0] if nodes else None)
+
+
+def led_attrs(node: str) -> list[str]:
+    """Control files the node actually exposes, in write order."""
+    return [name for name in LED_ATTRS if os.path.exists(f"{node}/{name}")]
+
+
+def apply_colour(mode: str, brightness: int) -> bool:
+    node = led_node()
+    if not node:
+        print("  no *kbd_backlight node found; colour not set "
+              "(the host lock is still released)")
+        return False
+    values = {"kbd_rgb_state": "1 1 1 1 1", RGB_ATTR: mode,
+              "brightness": str(brightness)}
+    available = led_attrs(node)
+    if RGB_ATTR not in available:
+        print(f"  {node} exposes no {RGB_ATTR}; setting brightness only")
+    ok = True
+    for name in available:
+        try:
+            with open(f"{node}/{name}", "w") as handle:
+                handle.write(values[name])
+        except OSError as exc:
+            print(f"  write {node}/{name} failed: {exc}")
             ok = False
+    if ok:
+        print(f"  {node}: mode '{mode}', brightness {brightness}")
     return ok
 
-def do_arm(mode_str):
-    nodes = find_kbd_hidraw()
-    if not nodes:
-        print(f"No keyboard matched USB id {VID}:{PID}.")
-        print("Find your keyboard's id with:")
-        print("  for n in /dev/hidraw*; do echo $n; "
-              "cat /sys/class/hidraw/$(basename $n)/device/uevent | grep HID_; done")
+
+# ---------- commands ----------
+
+def cmd_analyse() -> int:
+    devices = discover()
+    if not devices:
+        print("No HID device exposes a LampArray AutonomousMode field.\n"
+              "This tool does not apply here: if your keyboard is dark, its\n"
+              "lighting uses a different mechanism.")
         return 1
-    armed_any = False
-    for node, name in nodes:
-        try:
-            ids, _ = candidate_arm_ids(name)
-        except OSError as e:
-            print(f"{node}: cannot read descriptor: {e}")
-            continue
-        if not ids:
-            print(f"{node}: no vendor-page feature report IDs found")
-            continue
-        print(f"{node}: arming report IDs {[hex(x) for x in ids]}")
-        for rid in ids:
-            send_feature(node, rid)
-        armed_any = True
-    if not armed_any:
-        return 1
-    if mode_str:
-        if set_colour(mode_str):
-            print(f"set colour/mode: '{mode_str}'")
+
+    for device in devices:
+        print(f"{device.path}  {device.hid_id}  {device.name}")
+        # Read every control in one open, then report outside it.
+        with _hid_open(device.path) as fd:
+            states = [(control, read_mode(fd, control))
+                      for control in device.controls]
+        for control, state in states:
+            print(f"  {control}: {_fmt(state)}")
+        if all(state is None for _, state in states):
+            print("  this controller does not answer state queries, so the\n"
+                  "  current lock state is unknown; --arm writes regardless")
+
+    node = led_node()
+    if not node:
+        print("\nLED node: none found -- colour cannot be set, but releasing\n"
+              "the lock may still restore the keyboard's own lighting.")
     else:
-        print("controller armed (no colour given). Set one with --arm \"<mode>\" "
-              "or write to " + LED_BASE)
+        available = led_attrs(node)
+        print(f"\nLED node: {node} [{', '.join(available) or 'no controls'}]")
+        if RGB_ATTR not in available:
+            print(f"  no {RGB_ATTR} here -- brightness only, no colour control")
+
+    print(f'\nRelease the lock:  sudo {sys.argv[0]} --arm "{DEFAULT_MODE}"')
+    print("Add --install to reapply it on boot and resume.")
     return 0
 
-def do_analyse():
-    nodes = find_kbd_hidraw()
-    if not nodes:
-        print(f"No /dev/hidraw* matched USB id {VID}:{PID}.")
-        print("Find your keyboard's id with:")
-        print("  for n in /dev/hidraw*; do echo $n; "
-              "cat /sys/class/hidraw/$(basename $n)/device/uevent | grep HID_; done")
+
+def cmd_apply(mode: str, brightness: int) -> int:
+    devices = discover()
+    if not devices:
+        print("No LampArray device found. Run without arguments for details.")
         return 1
-    for node, name in nodes:
-        print(f"=== {node} ({name}) ===")
-        try:
-            ids, fids = candidate_arm_ids(name)
-        except OSError as e:
-            print(f"  cannot read descriptor: {e}")
-            continue
-        print("  Feature report IDs by usage page:")
-        for up in sorted(fids):
-            mark = "  <-- VENDOR (arm these)" if is_vendor_page(up) else ""
-            print(f"    page {hex(up)}: {[hex(x) for x in sorted(fids[up])]}{mark}")
-        print(f"  >> Candidate ARM report IDs: {[hex(x) for x in ids]}")
-    print("\nArm + set colour now, e.g. static white:")
-    print(f'  sudo python3 kbd-fix.py --arm "{DEFAULT_MODE}"')
-    print("Add --install to make it permanent across reboots.")
+    released = False
+    for device in devices:
+        print(f"{device.path} ({device.name}):")
+        released |= release_lock(device)
+    if not released:
+        return 1
+    if mode:
+        apply_colour(mode, brightness)
+    else:
+        print(f'  lock released; no colour given (try --arm "{DEFAULT_MODE}")')
     return 0
 
-# ---------- service install ----------
-def do_install(mode_str):
-    if not mode_str:
-        mode_str = DEFAULT_MODE
-    if not valid_mode_string(mode_str):
-        print(f"Refusing to install: invalid mode string '{mode_str}' "
-              "(need 6 integers 0-255, e.g. \"1 0 255 255 255 0\").")
-        return 1
+
+def cmd_install(mode: str, brightness: int) -> int:
     try:
-        src = os.path.abspath(__file__)
-    except NameError:
-        print("Cannot determine script path (piped input?). Save the script to a "
-              "file and run it from there to use --install.")
+        source = os.path.abspath(__file__)
+    except NameError:  # executed from stdin
+        print("--install needs the script saved to a file.", file=sys.stderr)
         return 1
-    try:
-        if os.path.abspath(src) != os.path.abspath(INSTALL_BIN):
-            shutil.copy(src, INSTALL_BIN)
-        os.chmod(INSTALL_BIN, 0o755)
-    except OSError as e:
-        print(f"could not copy to {INSTALL_BIN}: {e}")
-        return 1
-    # mode_str is validated above (digits/spaces only) so it is safe to embed.
-    service = f"""[Unit]
-Description=ASUS keyboard RGB arm and colour
+    # mode and brightness are validated as plain integers, so the values
+    # embedded in the unit file cannot inject additional directives.
+    unit = f"""\
+[Unit]
+Description=Release HID LampArray host lock and restore keyboard RGB
 After=multi-user.target suspend.target hibernate.target hybrid-sleep.target
 
 [Service]
 Type=oneshot
 ExecStartPre=/bin/sleep 3
-ExecStart=/usr/bin/env python3 {INSTALL_BIN} --arm "{mode_str}"
+ExecStart=/usr/bin/env python3 {INSTALL_BIN} --arm "{mode}" --brightness {brightness}
 
 [Install]
 WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target
 """
     try:
-        with open(SERVICE_PATH, "w") as f:
-            f.write(service)
-    except OSError as e:
-        print(f"could not write {SERVICE_PATH}: {e}")
+        if source != INSTALL_BIN:
+            shutil.copy(source, INSTALL_BIN)
+        os.chmod(INSTALL_BIN, 0o755)
+        with open(SERVICE_PATH, "w") as handle:
+            handle.write(unit)
+    except OSError as exc:
+        print(f"install failed: {exc}", file=sys.stderr)
         return 1
-    if os.system("systemctl daemon-reload") != 0:
-        print("warning: systemctl daemon-reload failed (is this a systemd system?)")
+    os.system("systemctl daemon-reload")
     os.system(f"systemctl enable --now {SERVICE_NAME}")
-    print(f"installed {SERVICE_PATH}")
-    print(f"  arms + sets mode '{mode_str}' on every boot and resume")
-    print(f"  remove with: sudo python3 kbd-fix.py --uninstall")
+    print(f"installed {SERVICE_PATH} (mode '{mode}', brightness {brightness})")
+    print(f"  remove with: sudo {sys.argv[0]} --uninstall")
     return 0
 
-def do_uninstall():
+
+def cmd_uninstall() -> int:
     os.system(f"systemctl disable --now {SERVICE_NAME} 2>/dev/null")
-    for p in (SERVICE_PATH, INSTALL_BIN):
+    for path in (SERVICE_PATH, INSTALL_BIN):
         try:
-            os.remove(p)
-            print(f"removed {p}")
+            os.remove(path)
+            print(f"removed {path}")
         except FileNotFoundError:
             pass
-        except OSError as e:
-            print(f"could not remove {p}: {e}")
+        except OSError as exc:
+            print(f"could not remove {path}: {exc}")
     os.system("systemctl daemon-reload")
     return 0
 
-# ---------- arg handling ----------
-def main():
-    args = sys.argv[1:]
 
-    if "--help" in args or "-h" in args:
-        print(__doc__)
-        return 0
+# ---------- main ----------
 
-    if "--uninstall" in args:
-        require_root()
-        return do_uninstall()
+def valid_mode(mode: str) -> bool:
+    """kbd_rgb_mode value: six integers 0-255, single-space separated."""
+    return bool(MODE_RE.match(mode)) and all(
+        int(part) <= 255 for part in mode.split())
 
-    if "--arm" in args:
-        require_root()
-        idx = args.index("--arm")
-        mode_str = ""
-        if idx + 1 < len(args) and not args[idx + 1].startswith("--"):
-            mode_str = args[idx + 1]
-        if mode_str and not valid_mode_string(mode_str):
-            print(f"Invalid mode string '{mode_str}'. Need 6 integers 0-255, "
-                  'e.g. "1 0 255 255 255 0" (save mode R G B speed).')
-            return 1
-        rc = do_arm(mode_str)
-        if "--install" in args and rc == 0:
-            return do_install(mode_str)
-        return rc
 
-    if "--install" in args:
-        require_root()
-        return do_install("")
+def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Release the HID LampArray host lock so the keyboard "
+                    "backlight works on Linux.",
+        epilog='example: sudo ./kbd-fix.py --arm "1 0 0 255 0 0" --install')
+    parser.add_argument(
+        "--arm", "--release", nargs="?", const="", metavar="MODE",
+        help='release the lock; optional colour "save mode R G B speed", '
+             'e.g. "1 0 255 255 255 0"')
+    parser.add_argument(
+        "--brightness", type=int, choices=range(4), default=DEFAULT_BRIGHTNESS,
+        metavar="0-3", help="LED brightness (default: 3)")
+    parser.add_argument("--install", action="store_true",
+                        help="also install a boot/resume systemd service")
+    parser.add_argument("--uninstall", action="store_true",
+                        help="remove the systemd service")
+    return parser.parse_args(argv)
 
-    # default: analyse (read-only, but descriptor read still needs root on most systems)
-    require_root()
-    return do_analyse()
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    if os.geteuid() != 0:
+        print("Needs root: sudo ./kbd-fix.py ...", file=sys.stderr)
+        return 1
+
+    if args.uninstall:
+        return cmd_uninstall()
+
+    if args.arm is None and not args.install:
+        return cmd_analyse()
+
+    mode = args.arm or ""
+    if mode and not valid_mode(mode):
+        print(f'Invalid mode "{mode}": expected six integers 0-255, '
+              'e.g. "1 0 255 255 255 0".', file=sys.stderr)
+        return 1
+
+    status = cmd_apply(mode, args.brightness) if args.arm is not None else 0
+    if status == 0 and args.install:
+        status = cmd_install(mode or DEFAULT_MODE, args.brightness)
+    return status
+
 
 if __name__ == "__main__":
     sys.exit(main())
