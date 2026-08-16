@@ -41,7 +41,7 @@ sudo ./kbd-fix.py
 sudo ./kbd-fix.py --arm "<mode string>"
 ```
 
-### 3. …and install a systemd service so it reapplies on boot and resume
+### 3. Release the lock, set a colour and install a systemd service so it reapplies on boot and resume
 ```bash
 sudo ./kbd-fix.py --arm "<mode string>" --install
 ```
@@ -92,8 +92,6 @@ sudo ./kbd-fix.py --arm "1 0 255 255 255 0" --install
 
 ## Compatibility
 
-Confirmed on **FA608FM, FA608PM, FA608UH, FA808UM, FA608UP, FA608WI and FA608WV**.
-
 Detection is by HID descriptor content, not by model or USB ID, so any device
 implementing LampArray should work. Colour control additionally needs an ASUS
 `*kbd_backlight` sysfs node; on other vendors' hardware the lock release still
@@ -113,21 +111,39 @@ older Aura protocol and this tool does not apply.
    sysfs interface.
 5. With `--install`, writes a systemd unit that repeats this on boot and resume.
 
+### Why release the lock rather than take it
+
+Writing `AutonomousMode = 0` and driving the lamps directly with
+`LampRangeUpdate` reports also works, and is the approach used in
+[asusctl#284](https://github.com/OpenGamingCollective/asusctl/issues/284).
+It gives host-side colour control without `asus-wmi`, but a userspace process
+must then own the lighting continuously. This tool takes the other route —
+handing control back to the firmware — so existing tools keep working and
+nothing stays resident.
+
 ## Caveats
 
 - Needs root.
 - The lock release does not survive a power-off — use `--install`.
-- **This controller does not answer `GET_FEATURE` on the control report**, so
-  the current lock state cannot be read. The tool reports `unreadable` and
-  writes regardless; that is expected, not an error.
+- **`AutonomousMode` is write-only on these controllers** — the write is
+  accepted but a `GET_FEATURE` on that report goes unanswered, so the lock
+  state cannot be verified. This is report-specific, not device-wide: the
+  attributes report *is* answerable, and the tool reads it to confirm the
+  channel works and report `LampCount`.
+- These keyboards report **`LampCount == 1`** — single zone. Static colour and
+  host-driven effects are possible; per-key is not.
 - Verified on cold boot, warm reboot and suspend/resume. **Hibernate is
   untested** and likely needs more: S4 removes controller power, so the lock
   returns during resume, after the service has already run on the way down.
-- This is a workaround. The real fix is kernel LampArray support — see
-  [asusctl#147](https://github.com/OpenGamingCollective/asusctl/pull/147).
-  Separately, `asusd` only probes USB parents, so it does not currently see
-  these I²C-HID keyboards at all; that is why `asusctl aura` reports
-  `Did not find xyz.ljones.Aura` even once the lock is released.
+- This is a workaround. The real fix is kernel/daemon-side LampArray support —
+  see [asusctl#284](https://github.com/OpenGamingCollective/asusctl/issues/284),
+  which proposes descriptor-keyed detection rather than a per-model allowlist.
+  (PR #147 was closed over authorship concerns, not a technical defect.)
+  Two separate gaps keep these keyboards dark: `hid-asus` never claims the
+  device because its alias is USB-only (`hid:b0003g*v00000B05p000019B6`), so an
+  I²C-HID keyboard falls through to `hid-generic` with no LED device registered;
+  and `asusd` only probes USB parents, so it never sees the keyboard at all —
+  which is why `asusctl aura` reports `Did not find xyz.ljones.Aura`.
 
 ## Background
 
