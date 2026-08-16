@@ -1,41 +1,69 @@
-# ASUS TUF Gaming Keyboard RGB Controller Fix
+# ASUS TUF Gaming Keyboard RGB Fix
 
-On ASUS TUF Gaming models, the keyboard RGB controller (ITE5570, USB id 0b05:19b6) must be "armed" on cold boot by sending HID feature reports to the keyboard. Windows/Armoury Crate handles this automatically, but Linux drivers currently do not.
+On modern ASUS TUF/ROG laptops the keyboard backlight stays dark on Linux after
+a cold boot, and `asusctl` or direct sysfs writes appear to succeed while
+nothing lights up.
 
-This tool reads your keyboard's HID report descriptor to discover the correct arming report IDs for YOUR specific model, arms the controller, sets a colour, and can install a systemd service so the lighting returns automatically on every boot and resume.
+The cause is not a missing driver. These keyboards implement **HID LampArray**
+(HID usage page `0x59`, "Lighting And Illumination") — the standard behind
+Windows Dynamic Lighting. Its `AutonomousMode` flag decides who owns the lamps:
+
+| Value | Meaning |
+|-------|---------|
+| `0`   | The **host** owns the lamps exclusively. Nothing else may change them — not the on-board effects, not the embedded controller. |
+| `1`   | The **device** may drive its own lamps again (firmware effects / EC control). |
+
+The controller powers up with `AutonomousMode = 0`, waiting for a Dynamic
+Lighting host that does not exist on Linux. The keys stay dark, and writes to
+`/sys/class/leds/*kbd_backlight` succeed in the kernel but are ignored by the
+device. Booting Windows clears it — Windows restores `AutonomousMode` when it
+releases the device — until the next power-off.
+
+**The fix is one feature report, one byte:** write `AutonomousMode = 1` to
+release the host lock. Afterwards the normal kernel colour interface works.
+This tool reads the report ID from your keyboard's own HID descriptor, so no
+per-model table is needed.
+
+You can watch this happen: on a cold boot the keyboard runs a colour sweep,
+goes dark the moment Linux enumerates the device, then lights when the fix
+runs. That is `device-controlled → host-locked → device-controlled`. On a
+*warm* reboot there is no sweep, because the controller never lost power.
 
 ## Usage
 
-### 1. Analyse only (read-only - just lists the report IDs for your model):
+### 1. Analyse (read-only — shows the control reports and LED node)
 ```bash
-sudo python3 kbd-fix.py
+sudo ./kbd-fix.py
 ```
 
-### 2. Arm + set colour now (mode string = kbd_rgb_mode format):
+### 2. Release the lock and set a colour
 ```bash
-sudo python3 kbd-fix.py --arm "<your mode string>"
+sudo ./kbd-fix.py --arm "<mode string>"
 ```
 
-### 3. Arm + set colour AND install a permanent boot/resume service:
+### 3. …and install a systemd service so it reapplies on boot and resume
 ```bash
-sudo python3 kbd-fix.py --arm "<your mode string>" --install
+sudo ./kbd-fix.py --arm "<mode string>" --install
 ```
 
-### 4. Remove the installed service:
+### 4. Remove the service
 ```bash
-sudo python3 kbd-fix.py --uninstall
+sudo ./kbd-fix.py --uninstall
 ```
+
+`--release` is an alias for `--arm`. `--brightness 0-3` sets the level
+(default 3).
 
 ## Mode String Format
 
-`MODE STRING = "save mode R G B speed"`
+`"save mode R G B speed"` — the kernel's `kbd_rgb_mode` format.
 
 - **save**: 1 = persist the setting
 - **mode**: 0 = static, 1 = breathe, 2 = rainbow/cycle (availability varies by model)
 - **R G B**: 0-255 each
 - **speed**: 0-2
 
-### Examples:
+### Examples
 - Static white: `"1 0 255 255 255 0"`
 - Static green: `"1 0 0 255 0 0"`
 - Static red: `"1 0 255 0 0 0"`
@@ -45,55 +73,87 @@ sudo python3 kbd-fix.py --uninstall
 ## Quick Start
 
 ```bash
-# Check your model's report IDs:
-sudo python3 kbd-fix.py
+# See what your machine exposes:
+sudo ./kbd-fix.py
 
-# Arm and set static white lighting:
-sudo python3 kbd-fix.py --arm "1 0 255 255 255 0"
+# Release the lock and set static white:
+sudo ./kbd-fix.py --arm "1 0 255 255 255 0"
 
-# Make it permanent (automatically arm on every boot/resume):
-sudo python3 kbd-fix.py --arm "1 0 255 255 255 0" --install
+# Make it permanent:
+sudo ./kbd-fix.py --arm "1 0 255 255 255 0" --install
 ```
 
 ## Requirements
 
-- Linux OS
-- Python 3.x
-- Root/sudo privileges (required for HID access and sysfs writes)
+- Linux with a `hidraw` interface
+- Python 3.9+ (standard library only)
+- systemd, for `--install`
+- Root privileges — raw HID access and sysfs writes
 
 ## Compatibility
 
-- ASUS TUF Gaming (so far confirmed working for FA608UP, FA608UH & FA808UM)
-- Other FA* variants should work via auto-detection but may need testing - please report results
+Confirmed on **FA608FM, FA608PM, FA608UH, FA808UM, FA608UP, FA608WI and FA608WV**.
+
+Detection is by HID descriptor content, not by model or USB ID, so any device
+implementing LampArray should work. Colour control additionally needs an ASUS
+`*kbd_backlight` sysfs node; on other vendors' hardware the lock release still
+applies but colour will not.
+
+Note that these keyboards are **I²C-HID** and do **not** appear in `lsusb`.
+If your ASUS keyboard shows up as an "N-Key Device" in `lsusb`, it uses the
+older Aura protocol and this tool does not apply.
 
 ## How It Works
 
-1. The tool scans `/dev/hidraw*` to find your keyboard (USB id 0b05:19b6)
-2. It parses the HID report descriptor to discover vendor-page FEATURE report IDs
-3. It sends 64-byte feature reports to arm the RGB controller
-4. It then sets your desired colour via the Linux kbd_backlight sysfs interface
-5. Optionally, it installs a systemd service that automatically repeats this on boot and resume
+1. Scans `/dev/hidraw*` and parses each HID report descriptor.
+2. Finds the feature report carrying usage `0x71` (`AutonomousMode`) on page
+   `0x59`, or on a vendor page mirroring it.
+3. Writes `AutonomousMode = 1` to that report, at its declared length.
+4. Sets your colour via the `kbd_rgb_mode` / `kbd_rgb_state` / `brightness`
+   sysfs interface.
+5. With `--install`, writes a systemd unit that repeats this on boot and resume.
 
 ## Caveats
 
-- Requires sudo (needs raw HID access and sysfs write permissions)
-- One-shot arming does not survive a full power-off; use `--install` for a permanent fix
-- If your keyboard's USB ID differs from 0b05:19b6, the tool will tell you how to find it
-- This is only a workaround. The real fix belongs upstream (kernel/asusctl); this only bridges the gap until then.
+- Needs root.
+- The lock release does not survive a power-off — use `--install`.
+- **This controller does not answer `GET_FEATURE` on the control report**, so
+  the current lock state cannot be read. The tool reports `unreadable` and
+  writes regardless; that is expected, not an error.
+- Verified on cold boot, warm reboot and suspend/resume. **Hibernate is
+  untested** and likely needs more: S4 removes controller power, so the lock
+  returns during resume, after the service has already run on the way down.
+- This is a workaround. The real fix is kernel LampArray support — see
+  [asusctl#147](https://github.com/OpenGamingCollective/asusctl/pull/147).
+  Separately, `asusd` only probes USB parents, so it does not currently see
+  these I²C-HID keyboards at all; that is why `asusctl aura` reports
+  `Did not find xyz.ljones.Aura` even once the lock is released.
 
 ## Background
 
-This script was created to address the issue discussed in the official `asusctl` repository:
-- [OpenGamingCollective/asusctl#119](https://github.com/OpenGamingCollective/asusctl/issues/119#issuecomment-4783713758)
+Discussed in the `asusctl` repository:
+[OpenGamingCollective/asusctl#119](https://github.com/OpenGamingCollective/asusctl/issues/119).
 
-The issue documents the RGB controller arming problem on FA608* and FA808* models and the solution implemented in this tool.
+Earlier versions of this tool broadcast feature reports to every vendor-page
+report ID and described the operation as "arming" the controller. That worked,
+but only because report `0x46` happened to be in the blast radius. The other
+writes were inert: `0x5F` is unrelated ASUS Aura and is declared as 50 bytes,
+so a 64-byte write was malformed and always a no-op. Reports `0x44`/`0x45` are
+genuine lamp-update reports.
+
+The widely shared `hidapitester --send-feature 70,1` is the same write:
+hidapitester takes **decimal** arguments, and 70 = `0x46`. Every model
+reported so far uses that same report — there is no per-model magic number.
 
 ## Support
 
-If you encounter any issues:
-1. Run `sudo python3 kbd-fix.py` to see your device's detected report IDs
-2. Check that your keyboard is detected (USB id 0b05:19b6)
-3. Report results on this repository or the [asusctl issue](https://github.com/OpenGamingCollective/asusctl/issues/119)
+If the keyboard stays dark:
+
+1. Run `sudo ./kbd-fix.py` and include the full output in your report.
+2. Confirm a LampArray device was found. If none is listed, your keyboard uses
+   a different lighting mechanism and this tool does not apply.
+3. Report results here or on
+   [asusctl#119](https://github.com/OpenGamingCollective/asusctl/issues/119).
 
 ## License
 
